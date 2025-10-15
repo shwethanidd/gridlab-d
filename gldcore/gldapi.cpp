@@ -1,5 +1,6 @@
 #include "gldapi.h"
 #include <cstdio>
+#include <fstream>
 #include "timestamp.h"
 #include "realtime.h"
 #include "exec.h"
@@ -7,6 +8,7 @@
 #include "threadpool.h"
 #include "cmdarg.h"
 #include "legal.h"
+#include "globals.h"
 #include "gldrandom.h"
 #include "module.h"
 #include "environment.h"
@@ -156,10 +158,26 @@ GLDErrorCode GridLabD::load_glm(int argc, char* argv[]) {
          */
         exit(XC_ARGERR);
     }
+    setup_after_load();
 
     return GLD_SUCCESS;
 }
 
+void set_clocks(std::optional<double> start_time, std::optional<double> stop_time) {
+    if (start_time.has_value()) {
+        printf("Setting start_time: %.2f\n", start_time.value());
+        global_starttime = start_time.value();
+    } else {
+        printf("Using previous start_time: %.2f\n", global_starttime);
+    }
+    if (stop_time.has_value()) {
+        printf("Setting stop_time: %.2f\n", stop_time.value());
+        global_stoptime = stop_time.value();
+    } else {
+        printf("Using previous stop_time: %.2f\n", global_stoptime);
+    }
+    global_clock = global_starttime;
+}
 // Load a GLM file
 GLDErrorCode GridLabD::setup_before_load() {
     
@@ -198,8 +216,8 @@ GLDErrorCode GridLabD::setup_before_load() {
 
 // Load a GLM file
 GLDErrorCode GridLabD::setup_after_load() {
-   
-
+    /* ensure clocks are synced */
+    global_clock = global_starttime;
     /* initialize scheduler */
     sched_init(0);
 
@@ -231,6 +249,12 @@ GLDErrorCode GridLabD::exit_gld(const std::string& filepath) {
     /* KML output */
     if (strcmp(global_kmlfile, "") != 0)
         kml_dump(global_kmlfile);
+
+    /* finalize all objects */
+    output_verbose("finalizing all objects");
+    if (exec_finalize_all() == FAILED) {
+        output_error("object finalization failed");
+    }
 
     /* terminate */
     module_termall();
@@ -272,9 +296,43 @@ GLDErrorCode GridLabD::exit_gld(const std::string& filepath) {
     return GLD_SUCCESS;
 }
 
-// Retrieve GLM data based on a query
-Json::Value GridLabD::get_glm_data() {
-    Json::Value checkpoint = do_checkpoint(nullptr); // Use default directory
+// Retrieve GLM data based on a query, optionally save to filepath
+Json::Value GridLabD::get_checkpoint_json(const std::string& filepath) {
+    Json::Value checkpoint;
+    
+    if (filepath.empty()) {
+        // If no filepath provided, just return the JSON without saving
+        checkpoint = do_checkpoint(nullptr);
+    } else {
+        // Extract directory from filepath for do_checkpoint
+        size_t last_slash = filepath.find_last_of("/\\");
+        std::string directory;
+        
+        if (last_slash != std::string::npos) {
+            directory = filepath.substr(0, last_slash);
+        } else {
+            directory = "."; // Current directory if no path separators found
+        }
+        
+        // Get checkpoint JSON with directory specified
+        checkpoint = do_checkpoint(directory.c_str());
+        
+        // Additionally save the JSON directly to the specified filepath
+        if (!checkpoint.empty()) {
+            std::ofstream json_file(filepath);
+            if (json_file.is_open()) {
+                Json::StreamWriterBuilder builder;
+                builder["indentation"] = "  "; // 2-space indentation
+                std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
+                writer->write(checkpoint, &json_file);
+                json_file.close();
+                printf("Checkpoint JSON saved to: %s\n", filepath.c_str());
+            } else {
+                printf("Error: Unable to open file '%s' for writing\n", filepath.c_str());
+            }
+        }
+    }
+    
     return checkpoint;
 }
 
@@ -315,68 +373,110 @@ GLDErrorCode GridLabD::edit_object(const std::string& name, const GLDData& updat
     return GLD_SUCCESS;
 }
 
+// Common helper to check environment and handle failures
+GLDErrorCode check_environment_and_handle_failure() {
+    if (strcmp(global_environment, "batch") != 0) {
+        output_fatal("%s environment not recognized or supported", global_environment);
+        /*	TROUBLESHOOT
+            The environment specified isn't supported. Currently only
+            the <b>batch</b> environment is normally supported, although 
+            some builds can support other environments, such as <b>matlab</b>.
+        */
+        return GLD_FAILED_TO_START;
+    }
+    return GLD_SUCCESS;
+}
+
+// Common helper to handle simulation failure with optional dump
+GLDErrorCode handle_simulation_failure(const char* context_message) {
+    output_fatal("shutdown after simulation stopped prematurely");
+    /*	TROUBLESHOOT
+        The simulation stopped because an unexpected condition was encountered.
+        This can be caused by a wide variety of things, but most often it is
+        because one of the objects in the model could not be synchronized 
+        properly and its clock stopped.  This message usually follows a
+        more specific message that indicates what caused the simulation to
+        stop.
+        */
+    if (global_dumpfile[0] != '\0') {
+        if (!saveall(global_dumpfile)) {
+            output_error("dump to '%s' failed", global_dumpfile);
+            /* TROUBLESHOOT
+                An attempt to create a dump file failed.  This message should be
+                preceded by a more detailed message explaining why it failed.
+                Follow the guidance for that message and try again.
+                */
+        } else {
+            output_debug("dump to '%s' complete", global_dumpfile);
+        }
+    }
+    return GLD_FAILED_TO_START;
+}
+
+// Common helper to ensure simulation is initialized for stepping
+GLDErrorCode ensure_simulation_initialized() {
+    if (!exec_is_initialized()) {
+        printf("Simulation not initialized, attempting to initialize...\n");
+        
+        GLDErrorCode env_check = check_environment_and_handle_failure();
+        if (env_check != GLD_SUCCESS) {
+            return env_check;
+        }
+        
+        if (run_preparation() == FAILED) {
+            printf("Failed to initialize simulation for stepping\n");
+            return GLD_OPERATION_FAILED;
+        }
+        
+        printf("Simulation initialized successfully\n");
+    }
+    return GLD_SUCCESS;
+}
+
 // Run simulation from start to end
-GLDErrorCode GridLabD::run(double start_time, double end_time) {
-    printf("Running simulation from %.2f to %.2f\n", start_time, end_time);
-    // Override the global clock if values are provided.
-    /* setup clocks */
-	if (start_time != 0.0) {
-        global_starttime = start_time;
-        global_clock = global_starttime;
-
+GLDErrorCode GridLabD::run(std::optional<double> start_time, std::optional<double> stop_time) {
+    set_clocks(start_time, stop_time);
+    
+    GLDErrorCode env_check = check_environment_and_handle_failure();
+    if (env_check != GLD_SUCCESS) {
+        return env_check;
     }
-    if (end_time != 0.0){
-        global_stoptime = end_time;
+    
+    if (exec_start() == FAILED) {
+        return handle_simulation_failure("exec_start failed");
     }
-
-	if (strcmp(global_environment,"batch")==0)
-	{
-		/* do the run */
-		if (exec_start()==FAILED)
-		{
-			output_fatal("shutdown after simulation stopped prematurely");
-			/*	TROUBLESHOOT
-				The simulation stopped because an unexpected condition was encountered.
-				This can be caused by a wide variety of things, but most often it is
-				because one of the objects in the model could not be synchronized 
-				propertly and its clock stopped.  This message usually follows a
-				more specific message that indicates what caused the simulation to
-				stop.
-				*/
-			if (global_dumpfile[0]!='\0')
-			{
-				if (!saveall(global_dumpfile))
-					output_error("dump to '%s' failed", global_dumpfile);
-					/* TROUBLESHOOT
-						An attempt to create a dump file failed.  This message should be
-						preceded by a more detailed message explaining why if failed.
-						Follow the guidance for that message and try again.
-						*/
-				else
-					output_debug("dump to '%s' complete", global_dumpfile);
-			}
-			return GLD_FAILED_TO_START;
-		}
-		return GLD_SUCCESS;
-	}
-	else
-	{
-		output_fatal("%s environment not recognized or supported",global_environment);
-		/*	TROUBLESHOOT
-			The environment specified isn't supported. Currently only
-			the <b>batch</b> environment is normally supported, although 
-			some builds can support other environments, such as <b>matlab</b>.
-		*/
-		return GLD_FAILED_TO_START;
-	}
-
+    
     return GLD_SUCCESS;
 }
 
 // Perform a single time step
 GLDErrorCode GridLabD::step(double& simulation_time) {
     printf("Stepping simulation forward\n");
-    simulation_time += 1.0;
+    
+    // Ensure simulation is initialized
+    GLDErrorCode init_result = ensure_simulation_initialized();
+    if (init_result != GLD_SUCCESS) {
+        simulation_time = (double)global_clock;
+        return init_result;
+    }
+    
+    // Store the current global clock before stepping
+    TIMESTAMP prev_clock = global_clock;
+    
+    // Execute a single simulation step
+    STATUS result = exec_step();
+    
+    if (result == FAILED) {
+        printf("Error occurred during simulation step\n");
+        simulation_time = (double)global_clock;
+        return GLD_OPERATION_FAILED;
+    }
+    
+    // Update the simulation time
+    simulation_time = (double)global_clock;
+    
+    printf("Stepped from time %.2f to %.2f\n", (double)prev_clock, simulation_time);
+    
     return GLD_SUCCESS;
 }
 
@@ -420,6 +520,16 @@ GLDErrorCode GridLabD::set_application_mode(GLDApplicationType mode) {
 
 // Set timestep
 GLDErrorCode GridLabD::set_time_step(double time_step) {
-    printf("Setting simulation time step to: %.2f\n", time_step);
+    if (time_step <= 0) {
+        printf("Error: Time step must be positive, got: %.2f\n", time_step);
+        return GLD_OPERATION_FAILED;
+    }
+    
+    // Convert to TIMESTAMP units (seconds to internal time units)
+    // GridLAB-D uses integer TIMESTAMP, so convert double seconds to integer
+    global_minimum_timestep = static_cast<int>(time_step);
+    
+    printf("Setting minimum simulation time step to: %d seconds\n", global_minimum_timestep);
     return GLD_SUCCESS;
 }
+
